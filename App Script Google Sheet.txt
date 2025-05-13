@@ -1,0 +1,154 @@
+// ========== 1. Receive Sensor Data from ESP32 ==========
+
+/**
+ * Handles incoming POST requests from the ESP32 sensor. 
+ * It parses the incoming data and appends it to the "Sheet1" sheet.
+ * After appending, it triggers the forecast generation.
+ */
+function doPost(e) {
+  var response = handleResponse(e); // Handle the POST data and get the response
+
+  // After data is appended to the sheet, generate forecasts
+  generateForecasts();
+
+  return response; // Return the response to the sender
+}
+
+/**
+ * Handles the response to the incoming data.
+ * This function parses the payload and appends the relevant data to the Google Sheets.
+ * It also ensures only one request is processed at a time using script lock.
+ */
+function handleResponse(e) {
+  var lock = LockService.getScriptLock();
+  lock.tryLock(10000); // Try to acquire the lock, wait for a max of 10 seconds
+
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1"); // Get the active sheet "Sheet1"
+
+    var payload;
+    // Check if there is data in the POST request
+    if (e.postData && e.postData.contents) {
+      payload = JSON.parse(e.postData.contents); // Parse the JSON data
+    } else {
+      // Return an error if no data is received
+      return ContentService.createTextOutput(JSON.stringify({
+        'status': 'error',
+        'message': 'No data received'
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var timestamp = new Date(); // Get the current timestamp
+    var data = [timestamp]; // Initialize data array with the timestamp
+
+    // Check if the payload contains moisture data and add it to the array
+    if (payload.moisture !== undefined) {
+      data.push(parseFloat(payload.moisture).toFixed(2)); // Round the moisture value to 2 decimal places
+    } else {
+      data.push(""); // Add empty value if moisture is not available
+    }
+
+    // Check if the payload contains status data and add it to the array
+    if (payload.status !== undefined) {
+      data.push(payload.status);
+    } else {
+      data.push(""); // Add empty value if status is not available
+    }
+
+    // Append the data to the sheet
+    sheet.appendRow(data);
+
+    // Return success message with timestamp to the sender
+    return ContentService.createTextOutput(JSON.stringify({
+      'status': 'success',
+      'timestamp': timestamp.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+
+  } catch (error) {
+    // Handle errors and return error message
+    return ContentService.createTextOutput(JSON.stringify({
+      'status': 'error',
+      'message': error.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock(); // Release the lock after processing the data
+  }
+}
+
+// ========== 2. Generate Forecast (EMA and write to both sheets) ==========
+
+/**
+ * Generates the Exponential Moving Average (EMA) forecast and writes it to the "EMA Forecast" sheet and 
+ * "Sheet1" (in column D).
+ * It computes the upper and lower bounds for each EMA value.
+ */
+function generateForecasts() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sourceSheet = ss.getSheetByName("Sheet1"); // Get the source sheet with sensor data
+  var forecastSheetName = "EMA Forecast"; // Forecast sheet name
+  var forecastSheet = ss.getSheetByName(forecastSheetName); // Try to get the forecast sheet
+
+  if (!forecastSheet) {
+    forecastSheet = ss.insertSheet(forecastSheetName); // If not found, create a new sheet
+  } else {
+    var lastRow = forecastSheet.getLastRow();
+    if (lastRow > 1) {
+      forecastSheet.deleteRows(2, lastRow - 1); // Clear previous forecast data (except the header)
+    }
+  }
+
+  forecastSheet.getRange("A1:D1").setValues([["Timestamp", "EMA", "Upper Bound", "Lower Bound"]]); // Set header in forecast sheet
+
+  var lastRow = sourceSheet.getLastRow(); // Get the last row of data in the source sheet
+  if (lastRow < 2) return; // Exit if no data exists
+
+  var timestamps = sourceSheet.getRange(2, 1, lastRow - 1).getValues().flat(); // Get timestamps from column 1
+  var moistureValues = sourceSheet.getRange(2, 2, lastRow - 1).getValues().flat(); // Get moisture values from column 2
+
+  var smoothing = 0.3; // Smoothing factor for EMA
+  var ema = null; // Initialize EMA value
+  var result = []; // Array to store the results
+  var emaList = []; // List to store EMA values for "Sheet1"
+
+  // Loop through moisture values and calculate the EMA
+  for (var i = 0; i < moistureValues.length; i++) {
+    var value = parseFloat(moistureValues[i]);
+    var timestamp = timestamps[i];
+
+    if (isNaN(value)) {
+      result.push([timestamp, "", "", ""]); // Add empty values if data is invalid
+      emaList.push([""]);
+      continue;
+    }
+
+    // Calculate EMA if it's the first value, otherwise apply the smoothing formula
+    if (ema === null) {
+      ema = value;
+    } else {
+      ema = smoothing * value + (1 - smoothing) * ema;
+    }
+
+    var emaVal = parseFloat(ema.toFixed(2)); // Round EMA to 2 decimal places
+    var upper = parseFloat((emaVal * 1.1).toFixed(2)); // Calculate upper bound (10% above EMA)
+    var lower = parseFloat((emaVal * 0.9).toFixed(2)); // Calculate lower bound (10% below EMA)
+
+    result.push([timestamp, emaVal, upper, lower]); // Add the result to the array
+    emaList.push([emaVal]); // Add EMA to the list for "Sheet1"
+  }
+
+  // Write forecast data to the "EMA Forecast" sheet
+  forecastSheet.getRange(2, 1, result.length, 4).setValues(result);
+  forecastSheet.getRange(2, 1, result.length, 1).setNumberFormat("mm/dd/yyyy hh:mm:ss");
+
+  // Write EMA values back to "Sheet1" column D
+  sourceSheet.getRange(2, 4, emaList.length, 1).setValues(emaList);
+}
+
+// ========== 3. Add Custom Menu ==========
+
+/**
+ * Creates a custom menu in Google Sheets for easy access to functions.
+ * The menu includes options to generate forecasts and clear all data.
+ */
+function onOpen() {
+  var ui = SpreadsheetA
